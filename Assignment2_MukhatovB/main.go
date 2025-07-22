@@ -1,12 +1,14 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -17,6 +19,7 @@ type Server struct {
 	data       map[string]string
 	requests   int
 	shutdownCh chan struct{}
+	wg         sync.WaitGroup
 }
 
 func NewServer() *Server {
@@ -29,11 +32,13 @@ func NewServer() *Server {
 func (s *Server) postDataHandler(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	
 	var entry map[string]string
 	if err := json.NewDecoder(r.Body).Decode(&entry); err != nil {
 		http.Error(w, "Invalid JSON", http.StatusBadRequest)
 		return
 	}
+	
 	for k, v := range entry {
 		s.data[k] = v
 	}
@@ -44,31 +49,46 @@ func (s *Server) postDataHandler(w http.ResponseWriter, r *http.Request) {
 func (s *Server) getDataHandler(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	json.NewEncoder(w).Encode(s.data)
+	
+	if err := json.NewEncoder(w).Encode(s.data); err != nil {
+		log.Printf("Error encoding response: %v", err)
+	}
 	s.requests++
 }
 
 func (s *Server) statsHandler(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	
 	stats := map[string]int{"requests": s.requests}
-	json.NewEncoder(w).Encode(stats)
+	if err := json.NewEncoder(w).Encode(stats); err != nil {
+		log.Printf("Error encoding response: %v", err)
+	}
 	s.requests++
 }
 
 func (s *Server) deleteDataHandler(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	key := r.URL.Path[len("/data/"):]
+	
+	key := strings.TrimPrefix(r.URL.Path, "/data/")
+	if key == "" {
+		http.Error(w, "Key is required", http.StatusBadRequest)
+		return
+	}
+	
 	delete(s.data, key)
 	s.requests++
 	w.WriteHeader(http.StatusOK)
 }
 
 func (s *Server) startBackgroundWorker() {
+	s.wg.Add(1)
 	go func() {
+		defer s.wg.Done()
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
+		
 		for {
 			select {
 			case <-ticker.C:
@@ -85,6 +105,7 @@ func (s *Server) startBackgroundWorker() {
 
 func (s *Server) shutdown() {
 	close(s.shutdownCh)
+	s.wg.Wait()
 }
 
 func main() {
@@ -94,20 +115,22 @@ func main() {
 	srv.startBackgroundWorker()
 
 	http.HandleFunc("/data", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == "POST" {
+		switch r.Method {
+		case http.MethodPost:
 			srv.postDataHandler(w, r)
-		} else if r.Method == "GET" {
+		case http.MethodGet:
 			srv.getDataHandler(w, r)
-		} else {
+		default:
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		}
 	})
 	http.HandleFunc("/data/", srv.deleteDataHandler)
 	http.HandleFunc("/stats", srv.statsHandler)
 
+	server := &http.Server{Addr: ":8080"}
 	go func() {
 		log.Println("Server is running on http://localhost:8080")
-		if err := http.ListenAndServe(":8080", nil); err != nil {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server failed: %s", err)
 		}
 	}()
@@ -117,6 +140,13 @@ func main() {
 	<-sig
 
 	log.Println("Shutting down server...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := server.Shutdown(ctx); err != nil {
+		log.Printf("HTTP server shutdown error: %v", err)
+	}
+
 	srv.shutdown()
-	time.Sleep(1 * time.Second)
+	log.Println("Server stopped gracefully")
 }
